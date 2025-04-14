@@ -1,0 +1,164 @@
+/**
+     * Método utilizado para checar se deve ser ignorado o arquivo
+     * @param Model_Arquivo $oArquivo
+     * @return bool
+     */
+    public function ignorarArquivo(Model_Arquivo $oArquivo)
+    {
+        $sNomeArquivo = $oArquivo->getNomeArquivoUsuario();
+        // arquivos a serem processados
+        $aArquivosProcessar = array ();
+
+        // verifica arquivo normal ou compactado
+        if (stristr($sNomeArquivo, '.zip') || stristr($sNomeArquivo, '.gz')) {
+            try {
+                $aArquivosProcessar = Model_Arquivo::descompactarArquivo($oArquivo);
+            } catch (Exception $e) {
+                throw new Exception($e->getMessage());
+            }
+        } else {
+            $aArquivosProcessar [] = $oArquivo;
+        }
+
+        $bIgnorarArquivo = true;
+        $listaRegistros = [];
+        $listaCodEntrega = [];
+        $listaCodCentro = [];
+        $listaCnpj = [];
+        $listaCodEntregaAntigo = [];
+
+        foreach ($aArquivosProcessar as $arquivoDescompactado) {
+            while (!$arquivoDescompactado->eof() && $bIgnorarArquivo) {
+                $lineContent = $arquivoDescompactado->fgets();
+
+                if (empty($lineContent)) {
+                    continue;
+                }
+
+                $codigoRegistro = substr($lineContent, 0, 3);
+                $listaRegistros [] = $codigoRegistro;
+
+                if ($codigoRegistro === '132') {
+                    $codigoEntrega = trim(substr($lineContent, 292, 2));
+                    $listaCodEntrega[] = $codigoEntrega;
+                }
+
+                if ($codigoRegistro === '135') {
+                    $codigoEntregaAntigo = trim(substr($lineContent, 157, 2));
+                    $listaCodEntregaAntigo[] = $codigoEntregaAntigo;
+                }
+
+                $listaRegistros[] = $codigoRegistro;
+
+                $conteudoOperacaoValido = trim(substr($lineContent, 17, 14));
+                if ($codigoRegistro ==  130
+                    && !empty($conteudoOperacaoValido)
+                    && $conteudoOperacaoValido == self::$OPERACAO_NATURA_VAREJO_FRETE_DEDICADO
+                ) {
+                    $listaRegistros[] = self::$OPERACAO_NATURA_VAREJO_FRETE_DEDICADO;
+                }
+
+                if ($codigoRegistro === '133') {
+                    $codigoCentro = substr($lineContent, 246, 4);
+                    $listaCodCentro[] = $codigoCentro;
+                }
+
+                if ($codigoRegistro === '131') {
+                    $cnpj = substr($lineContent, 3, 14);
+                    $listaCnpj[] = $cnpj;
+                }
+            }
+
+            if ($this->permitirRedirecionamentoArquivo($listaRegistros, $listaCodEntrega, $listaCodCentro, $listaCnpj, $listaCodEntregaAntigo)) {
+                $bIgnorarArquivo = false;
+            }
+
+            $oArquivo->rewind();
+
+            return $bIgnorarArquivo;
+        }
+    }
+
+    private function permitirRedirecionamentoArquivo($listaRegistros, $listaCodEntrega, $listaCodCentro, $listaCnpj, $listaCodEntregaAntigo)
+    {
+        switch ($this->tipoOperacao) {
+            case self::$OPERACAO_NATURA_ECOMMERCE:
+                return (in_array('51', $listaCodEntrega)
+                        || in_array('52', $listaCodEntrega)
+                        || in_array('53', $listaCodEntrega)
+                        || in_array('54', $listaCodEntrega))
+                    && in_array('5600', $listaCodCentro)
+                    && in_array('71673990003788', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_CONSULTORAS:
+                return (in_array('01', $listaCodEntrega)
+                        || in_array('02', $listaCodEntrega)
+                        || in_array('03', $listaCodEntrega)
+                        || in_array('04', $listaCodEntrega)
+                        || in_array('05', $listaCodEntrega))
+                    && in_array('5600', $listaCodCentro)
+                    && in_array('71673990003788', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_VAREJO:
+                return in_array(self::$OPERACAO_NATURA_VAREJO_FRETE_DEDICADO, $listaRegistros)
+                    && in_array('00190373000172', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_AVON_B2B:
+                return in_array(self::$OPERACAO_NATURA_VAREJO_FRETE_DEDICADO, $listaRegistros)
+                    && in_array('71673990005136', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_AVON:
+                return (in_array('51', $listaCodEntrega) || in_array('51', $listaCodEntregaAntigo))
+                    && in_array('5700', $listaCodCentro)
+                    && in_array('71673990005136', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_TBS:
+                return (in_array('98', $listaCodEntrega) || in_array('96', $listaCodEntrega)
+                        || in_array('98', $listaCodEntregaAntigo) || in_array('96', $listaCodEntregaAntigo))
+                    && (in_array('5800', $listaCodCentro) || in_array('5815', $listaCodCentro))
+                    && (in_array('71673990003940', $listaCnpj) || in_array('71673990004830', $listaCnpj));
+
+            case self::$OPERACAO_NATURA_SNAC:
+                return (in_array('24', $listaCodEntrega) || in_array('80', $listaCodEntregaAntigo))
+                    && in_array('5700', $listaCodCentro)
+                    && in_array('71673990005136', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_DECADAS:
+                return in_array('30', $listaCodEntrega)
+                    && in_array('5800', $listaCodCentro)
+                    && in_array('71673990003940', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_TBS_VAREJO:
+                return (in_array('90', $listaCodEntrega)
+                        || in_array('91', $listaCodEntrega)
+                        || in_array('92', $listaCodEntrega)
+                        || in_array('90', $listaCodEntregaAntigo)
+                        || in_array('91', $listaCodEntregaAntigo)
+                        || in_array('92', $listaCodEntregaAntigo))
+                    && (in_array('5800', $listaCodCentro) || in_array('5815', $listaCodCentro))
+                    && in_array('71673990003940', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_TBS_MURICI:
+                return (in_array('51', $listaCodEntrega) || in_array('51', $listaCodEntregaAntigo))
+                    && in_array('5100', $listaCodCentro)
+                    && in_array('71673990004679', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_TBS_CABREUVA:
+                return (in_array('30', $listaCodEntrega)
+                    && in_array('5700', $listaCodCentro)
+                    && in_array('71673990005136', $listaCnpj));
+
+            case self::$OPERACAO_NATURA_NASP_SP:
+                return (in_array('51', $listaCodEntrega) || in_array('51', $listaCodEntregaAntigo))
+                    && in_array('5815', $listaCodCentro)
+                    && in_array('71673990004830', $listaCnpj);
+
+            case self::$OPERACAO_NATURA_NASP_SUL:
+                return (in_array('51', $listaCodEntrega) || in_array('51', $listaCodEntregaAntigo))
+                    && in_array('5800', $listaCodCentro)
+                    && in_array('71673990003940', $listaCnpj);
+
+            default:
+                return false;
+        }
+    }
