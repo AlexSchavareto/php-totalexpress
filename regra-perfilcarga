@@ -1,0 +1,202 @@
+//Essa lógica foi feita para separar as informações de um arquivo NOTFIS para um json. O Json será construído em payloads separados por REIDs de acordo com cada encomenda que extraímos do NOTFIS, gerando um payload agrupado para cada cadastro. Respeitando a regra da API SMARTLABEL da TotalExpress
+
+
+
+/**
+     * Define o REID final baseado na regra de perfil de carga, para separação dos payloads.
+     * @param array $dadosEncomenda
+     * @return false|mixed
+     */
+    private function verificarPerfilCarga(array $dadosEncomenda)
+    {
+        $reidsDisponiveis = $this->definirReid($dadosEncomenda['CNPJ']);
+
+        if (empty($reidsDisponiveis)) {
+            throw new RuntimeException('Nenhum REID encontrado para o CNPJ ' . $dadosEncomenda['CNPJ']);
+        }
+
+        $peso = $dadosEncomenda['Peso'];
+        $volumes = $dadosEncomenda['Volumes'];
+        $valorTotal = $dadosEncomenda['NotaFiscal']['NfeValTotal'];
+
+        // Determina o tipo de processamento (1 = Manual, 2 = Automático)
+        $tipoProcessamento = 1;
+
+        // Regra para perfil AUTOMÁTICO
+        if (!($peso > 30 && $volumes == 1) &&
+            !$this->cnpjEstaNaTDE($dadosEncomenda['DestCpfCnpj']) &&
+            !$this->cepEstaNaRotaECT($dadosEncomenda['DestCep']) &&
+            $volumes <= 15 &&
+            $valorTotal <= 40000) {
+            $tipoProcessamento = 2;
+        }
+
+        // Retorna o REID correspondente ao tipo de processamento
+        return isset($reidsDisponiveis[$tipoProcessamento])
+            ? $reidsDisponiveis[$tipoProcessamento]
+            : current($reidsDisponiveis);
+    }
+
+    /**
+     * Retorna os REIDs do agrupador baseado no CNPJ (um reid de Perfil Manual e Automático).
+     * @param $cnpj
+     * @return array
+     */
+    private function definirReid($cnpj)
+    {
+        $db_corrier = DbFactory::getDbCorrierRelat();
+
+        $sql = "SELECT r.reid, rc.remcom_tipoprocessamento 
+        FROM remetentes r 
+        INNER JOIN remetentes_comercial rc ON r.reid = rc.reid 
+        WHERE r.reid_parent = 66049 
+        AND r.status = 'A' 
+        AND r.tipo_operacao = 'b2b' 
+        AND r.cgc = '{$cnpj}'";
+
+        $res = $db_corrier->Execute($sql);
+
+        if (!$res) {
+            throw new RuntimeException('Erro ao consultar os REIDs disponíveis');
+        }
+
+        $reidsDisponiveis = [];
+        while ($row = $res->fetch_assoc()) {
+            $reidsDisponiveis[$row['remcom_tipoprocessamento']] = $row['reid'];
+        }
+
+        return $reidsDisponiveis;
+    }
+
+    /**
+     * Realiza a separação dos payloads separados por REID e faz a numeração dos volumes pelo idCliente.
+     * @param $dados_encomenda
+     * @param $contador_enco
+     * @return void
+     * @throws Exception
+     */
+    private function definirVolumes($dados_encomenda, $contador_enco) {
+        $encomenda = $dados_encomenda[$contador_enco];
+        $reid = $this->verificarPerfilCarga($encomenda);
+
+        // O primeiro código de remessa da sequência
+        $baseCodigo = (int)preg_replace('/[^0-9]/', '', $encomenda['CodigoRemessa']);
+        $totalVolumes = (int)$encomenda['Volumes'];
+
+        // Gera a sequência de códigos
+        for ($i = 0; $i < $totalVolumes; $i++) {
+            $this->novosDadosEncomendas[] = array_merge(
+                $encomenda,
+                [
+                    'Volumes' => 1,
+                    'IdCliente' => (string)($baseCodigo + $i),
+                    'reid' => $reid
+                ]
+            );
+        }
+    }
+
+    /**
+     * Função resposável por chamar a classe de SmartLabel padrão.
+     * @param $grupoEncomendas
+     * @return array|Model_Ics_SmartLabel_Response
+     */
+    private function cadastrarEncomendaSmartLabel($grupoEncomendas)
+    {
+        try {
+            array_walk_recursive($grupoEncomendas, function(&$valor) {
+                $valor = utf8_encode($valor);
+            });
+
+            $dadosEncomenda = $this->getJsonFormatoSmartLabel($grupoEncomendas);
+
+            $array_headers = getallheaders();
+            $webservice = new Model_Ics_SmartLabel_Padrao($array_headers, $dadosEncomenda);
+            $response = $webservice->registrarEncomendasSemAutenticacao();
+        } catch (Exception $e) {
+            $response = [];
+            $response ['code'] = \Fig\Http\Message\StatusCodeInterface::STATUS_BAD_REQUEST;
+            $response ['data'] = utf8_encode($e->getMessage());
+            $response['retorno']['erros'][] = [
+                'erro' => $e->getMessage()
+            ];
+        }
+        return $response;
+    }
+
+    /**
+     * Prepara o payload final para cada encomenda/volume que será chamado no cadastrarEncomendaSmartLabel()
+     * @param $grupoEncomendas
+     * @return array
+     */
+    private function getJsonFormatoSmartLabel($grupoEncomendas) {
+        $listaEncomendas = [
+            'cnpj' => $grupoEncomendas[0]['CNPJ'],
+            'remetenteId' => $grupoEncomendas[0]['reid'],
+            'encomendas' => []
+        ];
+
+        // Agrupa encomendas por pedido para determinar o volume principal
+        $encomendasPorPedido = [];
+        foreach ($grupoEncomendas as $encomenda) {
+            $pedido = trim($encomenda['Pedido']);
+            if (!isset($encomendasPorPedido[$pedido])) {
+                $encomendasPorPedido[$pedido] = [];
+            }
+            $encomendasPorPedido[$pedido][] = $encomenda;
+        }
+
+        // Processa cada grupo de pedidos
+        foreach ($encomendasPorPedido as $pedido => $encomendas) {
+            $primeiroIdCliente = $encomendas[0]['IdCliente'];
+
+            foreach ($encomendas as $encomenda) {
+                // Volume principal é o primeiro de cada pedido OU encomenda com 1 volume
+                $isVolumePrincipal = ($encomenda['IdCliente'] === $primeiroIdCliente) ||
+                    (count($encomendas) == 1);
+
+                $encomendaFormatada = [
+                    'pedido' => $encomenda['Pedido'],
+                    'condFrete' => $encomenda['CondFrete'],
+                    'icmsIsencao' => $encomenda['IsencaoIcms'],
+                    'natureza' => $encomenda['Natureza'],
+                    'entregaTipo' => $encomenda['TipoEntrega'],
+                    'peso' => $isVolumePrincipal ? $encomenda['Peso'] : '0.00',
+                    'volumes' => $encomenda['Volumes'],
+                    'servicoTipo' => $encomenda['TipoServico'],
+                    'tipoPedido' => $encomenda['TipoPedido'],
+                    'clienteCodigo' => $encomenda['IdCliente'],
+                    'destinatario' => [
+                        'telefone1' => $encomenda['DestTelefone1'],
+                        'nome' => $encomenda['DestNome'],
+                        'cpfCnpj' => $encomenda['DestCpfCnpj'],
+                        'ie' => $encomenda['DestIe'],
+                        'endereco' => [
+                            'logradouro' => $encomenda['DestEnd'],
+                            'numero' => $encomenda['DestEndNum'],
+                            'bairro' => $encomenda['DestBairro'],
+                            'cidade' => $encomenda['DestCidade'],
+                            'cep' => $encomenda['DestCep'],
+                            'estado' => $encomenda['DestEstado']
+                        ]
+                    ],
+                    'docFiscal' => [
+                        'nfe' => [
+                            [
+                                'nfeValTotal' => $isVolumePrincipal ? $encomenda['NotaFiscal']['NfeValTotal'] : '0.00',
+                                'nfeValProd' => $isVolumePrincipal ? $encomenda['NotaFiscal']['NfeValProd'] : '0.00',
+                                'nfeNumero' => $encomenda['NotaFiscal']['NfeNumero'],
+                                'nfeSerie' => $encomenda['NotaFiscal']['NfeSerie'],
+                                'nfeData' => $encomenda['NotaFiscal']['NfeData'],
+                                'nfeChave' => $encomenda['NotaFiscal']['NfeChave']
+                            ]
+                        ]
+                    ]
+                ];
+
+                $listaEncomendas['encomendas'][] = $encomendaFormatada;
+            }
+        }
+
+        return $listaEncomendas;
+    }
